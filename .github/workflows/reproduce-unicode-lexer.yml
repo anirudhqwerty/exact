@@ -108,9 +108,9 @@ jobs:
           assert re.search(r'test result: ok\. 2 passed; 0 failed;', controls), controls
           assert re.search(r'test result: FAILED\. 0 passed; 3 failed; 0 ignored; 0 measured; 2 filtered out;', out), out
           assert err.count('UNICODE_DIAGNOSTIC_MISMATCH') == 3, err
-          for name in ['unicode_e', 'unicode_emoji', 'unicode_dash']:
-              assert re.search(r'test ' + name + r' \.\.\. FAILED', out), out
-          records = [line.split('|') for line in out.splitlines() if line.startswith('CASE|')]
+          failed = set(re.findall(r'^    (unicode_\w+)$', out, re.MULTILINE))
+          assert failed == {'unicode_e', 'unicode_emoji', 'unicode_dash'}, out
+          records = [record.split('|') for record in re.findall(r'CASE\|[^\r\n]+', out)]
           assert len(records) == 3 and {r[1] for r in records} == {'é', '🙂', '—'}, records
           summary = ['## Unicode lexer defect reproduced', '', 'Controls: 2 passed. Unicode correctness tests: 3 failed for the expected message assertion.', '', 'Actual production lexer diagnostics:', '', '```text']
           for _, token, identity, message, line, col, end, source in records:

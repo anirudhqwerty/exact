@@ -1,0 +1,132 @@
+name: Reproduce Unicode lexer diagnostics
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE: 94b8671f70fe2e25b307a40e7fce66dc27c9f802
+      CARGO_NET_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5
+          persist-credentials: false
+          sparse-checkout: |
+            /contract/syntax/
+            /.github/workflows/reproduce-unicode-lexer.yml
+          sparse-checkout-cone-mode: false
+      - name: Verify source and isolate production crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "$BASE^{commit}"
+          python3 - <<'PY'
+          import os, subprocess
+          changed = subprocess.check_output(['git', 'diff', '--name-only', os.environ['BASE'], 'HEAD'], text=True).splitlines()
+          assert set(changed) == {'.github/workflows/reproduce-unicode-lexer.yml', 'contract/syntax/tests/unicode_diagnostics.rs'}, changed
+          print('UPSTREAM_BASE=' + os.environ['BASE'])
+          print('REPRO_HEAD=' + subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip())
+          print('ONLY_CHANGES=' + repr(changed))
+          PY
+          git diff --exit-code "$BASE" HEAD -- contract/syntax/src contract/syntax/Cargo.toml
+          work="$RUNNER_TEMP/exact-unicode-repro"
+          mkdir -p "$work/harness/tests"
+          git archive "$BASE" contract/syntax | tar -x -C "$work"
+          cp contract/syntax/tests/unicode_diagnostics.rs "$work/harness/tests/"
+          cat > "$work/Cargo.toml" <<'TOML'
+          [workspace]
+          members = ["contract/syntax", "harness"]
+          default-members = ["harness"]
+          resolver = "2"
+          [workspace.package]
+          version = "0.1.0"
+          edition = "2021"
+          license = "MIT"
+          TOML
+          cat > "$work/harness/Cargo.toml" <<'TOML'
+          [package]
+          name = "unicode-lexer-repro"
+          version.workspace = true
+          edition.workspace = true
+          license.workspace = true
+          [dependencies]
+          contract-syntax = { path = "../contract/syntax" }
+          TOML
+          echo "WORK=$work" >> "$GITHUB_ENV"
+          echo 'Production crate extracted unchanged from pinned base; only harness and workspace manifests are generated.'
+      - name: Provision Rust on GitHub runner
+        run: rustup toolchain install 1.97.0 --profile minimal
+      - name: Compile only the dependency-free lexer harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          rustup override set 1.97.0
+          rustc --version
+          cargo metadata --offline --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python3 - <<'PY'
+          import json, os
+          m = json.load(open(os.environ['RUNNER_TEMP'] + '/metadata.json'))
+          assert {p['name'] for p in m['packages']} == {'contract-syntax', 'unicode-lexer-repro'}
+          assert all(p['source'] is None for p in m['packages'])
+          print('Only two local packages; no external dependencies.')
+          PY
+          cargo test --offline --test unicode_diagnostics --no-run
+      - name: Controls must pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          cargo test --offline --test unicode_diagnostics control_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/controls.txt"
+      - name: Record Unicode correctness regression failure
+        shell: bash
+        run: |
+          cd "$WORK"
+          set +e
+          cargo test --offline --test unicode_diagnostics unicode_ -- --nocapture --test-threads=1 > "$RUNNER_TEMP/unicode-stdout.txt" 2> "$RUNNER_TEMP/unicode-stderr.txt"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$RUNNER_TEMP/unicode-exit.txt"
+          echo "REGRESSION_EXIT=$status"
+          cat "$RUNNER_TEMP/unicode-stdout.txt"
+          cat "$RUNNER_TEMP/unicode-stderr.txt" >&2
+      - name: Verify specific expected failure and unchanged source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+          p = pathlib.Path(os.environ['RUNNER_TEMP'])
+          out = (p/'unicode-stdout.txt').read_text()
+          err = (p/'unicode-stderr.txt').read_text()
+          controls = (p/'controls.txt').read_text()
+          assert (p/'unicode-exit.txt').read_text().strip() == '101'
+          assert re.search(r'test result: ok\. 2 passed; 0 failed;', controls), controls
+          assert re.search(r'test result: FAILED\. 0 passed; 3 failed; 0 ignored; 0 measured; 2 filtered out;', out), out
+          assert err.count('UNICODE_DIAGNOSTIC_MISMATCH') == 3, err
+          for name in ['unicode_e', 'unicode_emoji', 'unicode_dash']:
+              assert re.search(r'test ' + name + r' \.\.\. FAILED', out), out
+          records = [line.split('|') for line in out.splitlines() if line.startswith('CASE|')]
+          assert len(records) == 3 and {r[1] for r in records} == {'é', '🙂', '—'}, records
+          summary = ['## Unicode lexer defect reproduced', '', 'Controls: 2 passed. Unicode correctness tests: 3 failed for the expected message assertion.', '', 'Actual production lexer diagnostics:', '', '```text']
+          for _, token, identity, message, line, col, end, source in records:
+              assert identity == 'syntax-unexpected-char'
+              assert (line,col,end,source) == ('3','10','10','0')
+              assert message != f'unexpected `{token}`'
+              assert message.startswith('unexpected `') and message.endswith('`')
+              text = f'{token} -> {identity}: {message}; span=({line},{col},{end},{source})'
+              print(text)
+              summary.append(text)
+          for token in ['é','🙂','—']:
+              assert f'QUOTED|{token}|lex=ok|parse=ok' in controls
+          summary += ['```', '', 'Base: `' + os.environ['BASE'] + '`', '', 'Production Lexer::tokenize executed. Full Contract CLI not tested.']
+          pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('\n'.join(summary)+'\n')
+          PY
+          mkdir -p "$RUNNER_TEMP/pristine"
+          git archive "$BASE" contract/syntax | tar -x -C "$RUNNER_TEMP/pristine"
+          diff -qr "$RUNNER_TEMP/pristine/contract/syntax" "$WORK/contract/syntax"
+          echo 'PRODUCTION_CRATE_UNCHANGED=true'
